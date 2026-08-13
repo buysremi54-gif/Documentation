@@ -1,0 +1,261 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+# ==============================
+# Configuration
+# ==============================
+
+LOGFILE="/var/log/pve-maintenance.log"
+
+VM_LIST="/var/log/pve-maintenance-vms.list"
+
+SERVICES=(
+    corosync
+    pve-cluster
+    pveproxy
+    pvedaemon
+    pvestatd
+    pve-ha-lrm
+    pve-ha-crm
+)
+
+exec > >(tee -a "$LOGFILE") 2>&1
+
+
+# ==============================
+# Fonctions
+# ==============================
+
+error()
+{
+    echo "[ERREUR] $1"
+    exit 1
+}
+
+
+check_cluster()
+{
+    echo "Vérification quorum..."
+
+    QUORUM=$(pvecm status | awk -F': ' '/Quorate/ {print $2}' | sed 's/Quorate//g' | tr -d '[:space:]')
+
+    if [ "$QUORUM" != "Yes" ]
+    then
+        error "Cluster non quorum"
+    fi
+
+    echo "Quorum OK"
+}
+
+
+
+check_ceph()
+{
+    echo "Vérification Ceph..."
+
+    if command -v ceph >/dev/null 2>&1
+    then
+        STATUS=$(ceph health | awk '{print $1}')
+
+        if [ "$STATUS" = "HEALTH_ERR" ]
+        then
+            error "Ceph en erreur"
+        fi
+
+        echo "Ceph OK : $STATUS"
+
+    else
+        echo "Ceph non installé"
+    fi
+}
+
+
+
+disable_maintenance()
+{
+    NODE=$1
+
+    echo "Désactivation maintenance HA : $NODE"
+
+    ha-manager crm-command node-maintenance disable "$NODE"
+
+    sleep 10
+}
+
+
+
+check_services()
+{
+    NODE=$1
+
+    echo "Vérification services..."
+
+
+    for SERVICE in "${SERVICES[@]}"
+    do
+
+        STATUS=$(ssh root@"$NODE" systemctl is-active "$SERVICE" || true)
+
+
+        if [ "$STATUS" != "active" ]
+        then
+            echo "[ERREUR] $SERVICE arrêté"
+            return 1
+        fi
+
+
+        ENABLED=$(ssh root@"$NODE" systemctl is-enabled "$SERVICE" || true)
+
+
+        if [ "$ENABLED" != "enabled" ]
+        then
+            echo "[ERREUR] $SERVICE non activé au démarrage"
+            return 1
+        fi
+
+
+        echo "$SERVICE OK"
+
+    done
+
+
+    return 0
+}
+
+
+
+check_node_cluster()
+{
+    NODE=$1
+
+    echo "Vérification présence de $NODE dans le cluster..."
+
+
+    if pvecm nodes | grep -q "$NODE"
+    then
+        echo "$NODE présent dans le cluster"
+
+    else
+        error "$NODE absent du cluster"
+    fi
+}
+
+
+
+start_vms()
+{
+    echo "Redémarrage des VM arrêtées pendant la maintenance..."
+
+
+    if [ ! -f "$VM_LIST" ]
+    then
+        echo "Aucune VM à redémarrer"
+        return
+    fi
+
+
+    while read -r VMID
+    do
+
+        if [ -n "$VMID" ]
+        then
+
+            echo "Démarrage VM $VMID"
+
+            qm start "$VMID"
+
+            sleep 5
+
+        fi
+
+    done < "$VM_LIST"
+
+
+    rm -f "$VM_LIST"
+
+
+    echo "Redémarrage des VM terminé"
+}
+
+
+
+# ==============================
+# Programme principal
+# ==============================
+
+
+echo "================================="
+echo "Fin maintenance PVE"
+date
+echo "================================="
+
+
+NODE=$(hostname -s)
+
+echo "Noeud traité : $NODE"
+
+
+echo "Attente stabilisation du noeud..."
+
+
+
+MAX_ATTEMPTS=10
+ATTEMPT=1
+
+
+while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]
+do
+
+    echo "================================="
+    echo "Tentative vérification services : $ATTEMPT/$MAX_ATTEMPTS"
+    echo "================================="
+
+
+    if check_services "$NODE"
+    then
+        echo "Tous les services sont opérationnels"
+        break
+    fi
+
+
+    if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]
+    then
+        echo "Services toujours KO après $MAX_ATTEMPTS tentatives"
+    fi
+
+
+    echo "Nouvelle tentative dans 60 secondes..."
+
+    sleep 40
+
+
+    ATTEMPT=$((ATTEMPT + 1))
+
+done
+
+sleep 30
+
+check_cluster
+
+check_ceph
+
+check_node_cluster "$NODE"
+
+
+
+disable_maintenance "$NODE"
+
+
+
+start_vms
+
+
+
+echo "$NODE terminé"
+
+
+echo
+echo "================================="
+echo "Maintenance cluster terminée"
+echo "================================="

@@ -1,0 +1,184 @@
+#!/bin/bash
+
+set -Eeuo pipefail
+
+
+# ==============================
+# Configuration
+# ==============================
+
+LOGFILE="/var/log/pve-maintenance-start.log"
+
+VM_LIST="/var/log/pve-maintenance-vms.list"
+
+exec > >(tee -a "$LOGFILE") 2>&1
+
+
+# ==============================
+# Fonctions
+# ==============================
+
+error()
+{
+    echo "[ERREUR] $1"
+    exit 1
+}
+
+
+check_cluster()
+{
+    echo "Vérification quorum..."
+
+    QUORUM=$(pvecm status | awk -F': ' '/Quorate/ {print $2}' | sed 's/Quorate//g' | tr -d '[:space:]')
+
+    if [ "$QUORUM" != "Yes" ]
+    then
+        error "Cluster non quorum"
+    fi
+
+    echo "Quorum OK"
+}
+
+
+
+check_ceph()
+{
+    echo "Vérification Ceph..."
+
+    if command -v ceph >/dev/null 2>&1
+    then
+
+        STATUS=$(ceph health | awk '{print $1}')
+
+        if [[ "$STATUS" == "HEALTH_ERR" ]]
+        then
+            error "Ceph en erreur"
+        fi
+
+        echo "Ceph OK : $STATUS"
+
+    else
+
+        echo "Ceph non installé"
+
+    fi
+}
+
+
+
+enable_maintenance()
+{
+    NODE=$(hostname -s)
+
+    echo "Activation maintenance HA : $NODE"
+
+    ha-manager crm-command node-maintenance enable "$NODE"
+
+    sleep 10
+
+    echo "Maintenance activée"
+}
+
+
+
+wait_vm_migration()
+{
+    NODE=$(hostname -s)
+
+    echo "Vérification des VM sur $NODE..."
+
+    # Récupération des VM gérées par HA AVANT leur migration
+    HA_VMS=$(pvesh get /cluster/ha/resources --output-format json 2>/dev/null |jq -r '.[] | select(.sid | startswith("vm:")) | .sid' |sed 's/^vm://')
+
+    echo "VM HA détectées : ${HA_VMS:-Aucune}"
+
+    while true
+    do
+        VM_PRESENT=0
+
+        # Récupération des VM actuellement présentes sur le nœud
+        VM_LIST_NODE=$(pvesh get /nodes/"$NODE"/qemu --output-format json 2>/dev/null |jq -r '.[] | select(.status=="running") | .vmid')
+
+        for VMID in $VM_LIST_NODE
+        do
+            # VM gérée par HA
+            if echo "$HA_VMS" | grep -qx "$VMID"
+            then
+                echo "VM $VMID gérée par HA, migration en cours ou en attente"
+                VM_PRESENT=1
+                continue
+            fi
+
+            # VM non-HA
+            echo "VM $VMID non HA, arrêt demandé"
+
+            # Évite les doublons dans VM_LIST
+            if ! grep -qx "$VMID" "$VM_LIST" 2>/dev/null
+            then
+                echo "$VMID" >> "$VM_LIST"
+            fi
+
+            qm shutdown "$VMID"
+
+            while [ "$(qm status "$VMID" 2>/dev/null | awk '{print $2}')" != "stopped" ]
+            do
+                echo "Attente arrêt VM $VMID"
+                sleep 5
+            done
+
+            echo "VM $VMID arrêtée"
+        done
+
+        # Vérification finale des VM encore en fonctionnement
+        RUNNING_VMS=$(pvesh get /nodes/"$NODE"/qemu --output-format json 2>/dev/null |jq -r '.[] | select(.status=="running") | .vmid')
+
+        if [ -z "$RUNNING_VMS" ]
+        then
+            echo "Plus aucune VM active sur $NODE"
+            break
+        fi
+
+        echo "VM encore actives sur $NODE : $RUNNING_VMS"
+        echo "Attente de la fin des migrations HA..."
+
+        sleep 20
+    done
+}
+
+
+# ==============================
+# Programme principal
+# ==============================
+
+
+echo "================================="
+echo "Début mise en maintenance PVE"
+echo "$(date)"
+echo "================================="
+
+
+# Nouvelle maintenance = nouvelle liste VM
+rm -f "$VM_LIST"
+touch "$VM_LIST"
+
+
+NODE=$(hostname -s)
+
+echo "Noeud traité : $NODE"
+
+
+check_cluster
+sleep 10
+
+check_ceph
+sleep 10
+
+enable_maintenance
+sleep 10
+
+wait_vm_migration
+sleep 10
+
+echo "================================="
+echo "Noeud $NODE en maintenance"
+echo "================================="
