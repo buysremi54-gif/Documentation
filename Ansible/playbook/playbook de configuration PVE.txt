@@ -1,0 +1,239 @@
+---
+
+- name: "Maintenance et mise à jour Proxmox"
+  hosts: PROXMOX_9
+  gather_facts: true
+  serial: 1
+  become: yes
+
+  tasks:
+
+
+    # START MAINTENANCE
+
+    - name: "Activation maintenance PVE"
+      ansible.builtin.command:
+        cmd: /opt/pve-maintenance/pve-maintenance-start.sh
+      register: maintenance_start
+
+
+    - name: "Contrôle activation maintenance"
+      ansible.builtin.fail:
+        msg: "Impossible de mettre le noeud en maintenance"
+      when: maintenance_start.rc != 0
+
+
+
+    # CONFIGURATION SYSTEME
+
+    - name: "Vérification locale"
+      community.general.locale_gen:
+        name: fr_FR.UTF-8
+        state: present
+
+
+    - name: "Configuration locale"
+      ansible.builtin.debconf:
+        name: locales
+        question: locales/default_environment_locale
+        value: fr_FR.UTF-8
+        vtype: select
+
+
+    - name: "Configuration LANG"
+      ansible.builtin.lineinfile:
+        dest: /etc/default/locale
+        regexp: '^LANG=.*$'
+        line: LANG=fr_FR.UTF-8
+        create: yes
+        state: present
+
+
+    - name: "Configuration timezone"
+      ansible.builtin.file:
+        src: /usr/share/zoneinfo/Europe/Paris
+        dest: /etc/localtime
+        force: yes
+        state: link
+
+
+
+    - name: "Application locale"
+      ansible.builtin.command:
+        cmd: update-locale LANG=fr_FR.UTF-8 LC_ALL=fr_FR.UTF-8
+
+
+
+    # DEPOTS APT
+
+    - name: "Copie apt.conf"
+      ansible.builtin.copy:
+        src: /opt/ansible/conf_proxmox_9/apt.conf
+        dest: /etc/apt/apt.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+
+    - name: "Copie sources.list"
+      ansible.builtin.copy:
+        src: /opt/ansible/conf_proxmox_9/sources.list
+        dest: /etc/apt/sources.list
+        mode: '0644'
+
+
+    - name: "Copie ceph.list"
+      ansible.builtin.copy:
+        src: /opt/ansible/conf_proxmox_9/ceph.list
+        dest: /etc/apt/sources.list.d/ceph.list
+        owner: root
+        group: root
+        mode: '0644'
+
+
+    - name: "Suppression dépôt enterprise"
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/pve-enterprise.sources
+        state: absent
+
+
+    - name: "rm dépots enterprise"
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/pve-enterprise.sources
+        state: absent
+
+
+
+
+    # UPDATE SYSTEME
+
+    - name: "Mise à jour APT"
+      ansible.builtin.apt:
+        update_cache: yes
+
+
+    - name: "Upgrade système"
+      ansible.builtin.apt:
+        upgrade: dist
+
+
+
+    # INSTALLATION PAQUETS
+
+    - name: "Installation outils"
+      ansible.builtin.apt:
+        state: present
+        name:
+          - apache2-utils
+          - apt-transport-https
+          - archivemount
+          - bzip2
+          - curl
+          - dfc
+          - diffutils
+          - dirmngr
+          - dnsutils
+          - encfs
+          - gzip
+          - htop
+          - ifenslave
+          - iftop
+          - intel-microcode
+          - iotop
+          - iperf
+          - jnettop
+          - jq
+          - lbzip2
+          - libsasl2-modules
+          - lm-sensors
+          - lsscsi
+          - multitail
+          - net-tools
+          - nmon
+          - openvswitch-common
+          - openvswitch-switch
+          - p7zip-full
+          - pigz
+          - postfix-pcre
+          - python3
+          - rsync
+          - screen
+          - sshfs
+          - sudo
+          - strace
+          - tcptraceroute
+          - tmux
+          - tree
+          - tzdata
+          - unzip
+          - vim
+          - wget
+          - xz-utils
+          - zip
+          - zram-tools
+
+
+
+    - name: "Swap Off"
+      shell: "swapoff -a"
+      when: chg1_sysctl.changed
+
+    - name: "Swap On"
+      shell: "swapon -a"
+      when: chg1_sysctl.changed
+
+    - name: "Service ZRAMSWAP"
+      service:
+        name: zramswap
+        state: restarted
+      when: chg1_sysctl.changed
+
+
+    # CHRONY
+
+    - name: "Installation Chrony"
+      ansible.builtin.apt:
+        name: chrony
+        state: present
+
+
+    - name: "Copie configuration Chrony"
+      ansible.builtin.copy:
+        src: /opt/ansible/conf_proxmox_9/chrony.conf
+        dest: /etc/chrony/chrony.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restart Chrony
+
+
+
+    # REBOOT
+
+    - name: "Redémarrage noeud"
+      ansible.builtin.reboot:
+        reboot_timeout: 480
+
+
+    # STOP MAINTENANCE
+
+    - name: "Sortie maintenance PVE"
+      ansible.builtin.command:
+        cmd: /opt/pve-maintenance/pve-maintenance-stop.sh
+      register: maintenance_stop
+
+
+    - name: "Contrôle sortie maintenance"
+      ansible.builtin.fail:
+        msg: "Impossible de sortir le noeud de maintenance"
+      when: maintenance_stop.rc != 0
+
+
+
+  handlers:
+
+    - name: "Restart Chrony"
+      ansible.builtin.service:
+        name: chrony
+        state: restarted
+
