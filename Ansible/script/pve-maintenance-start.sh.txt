@@ -25,7 +25,7 @@ error()
 }
 
 
-check_cluster()
+in_cluster()
 {
     echo "Vérification quorum..."
 
@@ -41,7 +41,7 @@ check_cluster()
 
 
 
-check_ceph()
+ceph_ok()
 {
     echo "Vérification Ceph..."
 
@@ -66,7 +66,7 @@ check_ceph()
 
 
 
-enable_maintenance()
+maintenance_on()
 {
     NODE=$(hostname -s)
 
@@ -167,13 +167,13 @@ NODE=$(hostname -s)
 echo "Noeud traité : $NODE"
 
 
-check_cluster
+in_cluster
 sleep 10
 
-check_ceph
+ceph_ok
 sleep 10
 
-enable_maintenance
+maintenance_off
 sleep 10
 
 wait_vm_migration
