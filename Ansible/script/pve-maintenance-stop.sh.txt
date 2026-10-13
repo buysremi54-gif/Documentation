@@ -7,7 +7,6 @@ set -Eeuo pipefail
 # ==============================
 
 LOGFILE="/var/log/pve-maintenance.log"
-
 VM_LIST="/var/log/pve-maintenance-vms.list"
 
 SERVICES=(
@@ -22,6 +21,8 @@ SERVICES=(
 
 exec > >(tee -a "$LOGFILE") 2>&1
 
+trap 'echo "[ERREUR] ligne $LINENO : $BASH_COMMAND"' ERR
+
 
 # ==============================
 # Fonctions
@@ -34,226 +35,140 @@ error()
 }
 
 
-check_cluster()
+# retry <essais> <délai en s> <description> <commande...>
+retry()
 {
-    echo "Vérification quorum..."
+    local max=$1 delay=$2 desc=$3 n=1
+    shift 3
 
-    QUORUM=$(pvecm status | awk -F': ' '/Quorate/ {print $2}' | sed 's/Quorate//g' | tr -d '[:space:]')
-
-    if [ "$QUORUM" != "Yes" ]
-    then
-        error "Cluster non quorum"
-    fi
-
-    echo "Quorum OK"
-}
-
-
-
-check_ceph()
-{
-    echo "Vérification Ceph..."
-
-    if command -v ceph >/dev/null 2>&1
-    then
-        STATUS=$(ceph health | awk '{print $1}')
-
-        if [ "$STATUS" = "HEALTH_ERR" ]
-        then
-            error "Ceph en erreur"
-        fi
-
-        echo "Ceph OK : $STATUS"
-
-    else
-        echo "Ceph non installé"
-    fi
-}
-
-
-
-disable_maintenance()
-{
-    NODE=$1
-
-    echo "Désactivation maintenance HA : $NODE"
-
-    ha-manager crm-command node-maintenance disable "$NODE"
-
-    sleep 10
-}
-
-
-
-check_services()
-{
-    NODE=$1
-
-    echo "Vérification services..."
-
-
-    for SERVICE in "${SERVICES[@]}"
+    until "$@"
     do
-
-        STATUS=$(ssh root@"$NODE" systemctl is-active "$SERVICE" || true)
-
-
-        if [ "$STATUS" != "active" ]
-        then
-            echo "[ERREUR] $SERVICE arrêté"
-            return 1
-        fi
-
-
-        ENABLED=$(ssh root@"$NODE" systemctl is-enabled "$SERVICE" || true)
-
-
-        if [ "$ENABLED" != "enabled" ]
-        then
-            echo "[ERREUR] $SERVICE non activé au démarrage"
-            return 1
-        fi
-
-
-        echo "$SERVICE OK"
-
+        [ "$n" -ge "$max" ] && error "$desc : échec après $max tentatives"
+        echo "$desc : tentative $n/$max échouée, nouvel essai dans ${delay}s"
+        sleep "$delay"
+        n=$((n + 1))
     done
 
+    echo "$desc : OK"
+}
+
+
+pmxcfs_ok()
+{
+    mountpoint -q /etc/pve && systemctl is-active --quiet pve-cluster
+}
+
+
+services_ok()
+{
+    local S
+
+    for S in "${SERVICES[@]}"
+    do
+        systemctl is-active --quiet "$S"  || { echo "[ERREUR] $S arrêté"; return 1; }
+        systemctl is-enabled --quiet "$S" || { echo "[ERREUR] $S non activé au démarrage"; return 1; }
+    done
 
     return 0
 }
 
 
-
-check_node_cluster()
+quorum_ok()
 {
-    NODE=$1
-
-    echo "Vérification présence de $NODE dans le cluster..."
-
-
-    if pvecm nodes | grep -q "$NODE"
-    then
-        echo "$NODE présent dans le cluster"
-
-    else
-        error "$NODE absent du cluster"
-    fi
+    pvecm status | grep -q '^Quorate:.*Yes'
 }
 
+
+ceph_ok()
+{
+    # Ceph non configuré sur ce cluster : on ignore
+    [ -f /etc/pve/ceph.conf ] || return 0
+
+    local s
+    s=$(timeout 20 ceph health 2>/dev/null | awk '{print $1}') || return 1
+
+    echo "Ceph : $s"
+    [ -n "$s" ] && [ "$s" != "HEALTH_ERR" ]
+}
+
+
+in_cluster()
+{
+    local out
+    out=$(pvecm nodes) || return 1
+
+    # grep -w sur la sortie capturée : pas de pipe, pas de SIGPIPE
+    grep -qw "$NODE" <<< "$out"
+}
+
+
+maintenance_off()
+{
+    ha-manager crm-command node-maintenance disable "$NODE"
+}
 
 
 start_vms()
 {
     echo "Redémarrage des VM arrêtées pendant la maintenance..."
 
-
     if [ ! -f "$VM_LIST" ]
     then
         echo "Aucune VM à redémarrer"
-        return
+        return 0
     fi
 
+    local VMID
 
-    while read -r VMID
+    while read -r VMID || [ -n "$VMID" ]
     do
+        [ -n "$VMID" ] || continue
 
-        if [ -n "$VMID" ]
+        # VM déjà démarrée (par HA par exemple) : on passe
+        if qm status "$VMID" 2>/dev/null | grep -q "running"
         then
-
-            echo "Démarrage VM $VMID"
-
-            qm start "$VMID"
-
-            sleep 5
-
+            echo "VM $VMID déjà démarrée"
+            continue
         fi
+
+        echo "Démarrage VM $VMID"
+        qm start "$VMID" || echo "[WARN] VM $VMID non démarrée"
+
+        sleep 5
 
     done < "$VM_LIST"
 
-
     rm -f "$VM_LIST"
-
 
     echo "Redémarrage des VM terminé"
 }
-
 
 
 # ==============================
 # Programme principal
 # ==============================
 
-
 echo "================================="
 echo "Fin maintenance PVE"
 date
 echo "================================="
 
-
 NODE=$(hostname -s)
-
 echo "Noeud traité : $NODE"
 
+# /etc/pve (pmxcfs) doit être monté après le reboot
+retry 30 10 "Montage /etc/pve"        pmxcfs_ok
 
-echo "Attente stabilisation du noeud..."
+retry 10 30 "Services PVE"            services_ok
+retry 30 10 "Quorum"                  quorum_ok
+retry 20 15 "Ceph"                    ceph_ok
+retry 10 10 "Présence de $NODE"       in_cluster
 
-
-
-MAX_ATTEMPTS=10
-ATTEMPT=1
-
-
-while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]
-do
-
-    echo "================================="
-    echo "Tentative vérification services : $ATTEMPT/$MAX_ATTEMPTS"
-    echo "================================="
-
-
-    if check_services "$NODE"
-    then
-        echo "Tous les services sont opérationnels"
-        break
-    fi
-
-
-    if [ "$ATTEMPT" -eq "$MAX_ATTEMPTS" ]
-    then
-        echo "Services toujours KO après $MAX_ATTEMPTS tentatives"
-    fi
-
-
-    echo "Nouvelle tentative dans 60 secondes..."
-
-    sleep 40
-
-
-    ATTEMPT=$((ATTEMPT + 1))
-
-done
-
-sleep 30
-
-check_cluster
-
-check_ceph
-
-check_node_cluster "$NODE"
-
-
-
-disable_maintenance "$NODE"
-
-
+retry 12 10 "Sortie maintenance HA"   maintenance_off
 
 start_vms
 
-
-
 echo "$NODE terminé"
-
 
 echo
 echo "================================="
