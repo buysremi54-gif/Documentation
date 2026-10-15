@@ -108,6 +108,50 @@ maintenance_off()
 }
 
 
+# IPv4 de la VM : interface qui porte la MAC de net0 (ignore docker0, bridges, IPv6)
+vm_ip()
+{
+    local mac
+
+    mac=$(qm config "$1" | grep -oiP '^net0: [^=]+=\K([0-9a-f]{2}:){5}[0-9a-f]{2}') || return 1
+
+    qm guest cmd "$1" network-get-interfaces 2>/dev/null | MAC="${mac,,}" perl -MJSON::PP -0777 -ne '
+        for my $i (@{ decode_json($_) }) {
+            next if lc($i->{"hardware-address"} // "") ne $ENV{MAC};
+            for my $a (@{ $i->{"ip-addresses"} // [] }) {
+                if ($a->{"ip-address-type"} eq "ipv4") { print $a->{"ip-address"}; exit }
+            }
+        }' 2>/dev/null | grep .
+}
+
+
+# Attend le SSH (port 22) d'une VM (5 min max) et dit pourquoi ça échoue
+wait_vm_ssh()
+{
+    local vmid=$1 ip n
+
+    for n in $(seq 30)
+    do
+        ip=$(vm_ip "$vmid" || true)
+
+        if [ -z "$ip" ]
+        then
+            echo "VM $vmid : IP introuvable via l'agent ($n/30)"
+        elif timeout 5 bash -c 'exec 3<>/dev/tcp/$0/22' "$ip" 2>/dev/null
+        then
+            echo "VM $vmid ($ip) : SSH OK"
+            return 0
+        else
+            echo "VM $vmid ($ip) : port 22 fermé ($n/30)"
+        fi
+
+        sleep 10
+    done
+
+    return 1
+}
+
+
 start_vms()
 {
     echo "Redémarrage des VM arrêtées pendant la maintenance..."
@@ -128,13 +172,17 @@ start_vms()
         if qm status "$VMID" 2>/dev/null | grep -q "running"
         then
             echo "VM $VMID déjà démarrée"
+            wait_vm_ssh "$VMID" || error "VM $VMID : SSH KO, arrêt avant les VM suivantes"
             continue
         fi
 
         echo "Démarrage VM $VMID"
-        qm start "$VMID" || echo "[WARN] VM $VMID non démarrée"
-
-        sleep 5
+        if qm start "$VMID"
+        then
+            wait_vm_ssh "$VMID" || error "VM $VMID : SSH KO, arrêt avant les VM suivantes"
+        else
+            echo "[WARN] VM $VMID non démarrée"
+        fi
 
     done < "$VM_LIST"
 
