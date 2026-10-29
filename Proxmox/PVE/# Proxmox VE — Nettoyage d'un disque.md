@@ -1,4 +1,4 @@
-# Proxmox VE — Nettoyage d'un disque Ceph après retrait d'un OSD
+Proxmox VE — Nettoyage d'un disque Ceph après retrait d'un OSD
 
 ## 1. Objectif
 
@@ -12,9 +12,7 @@ L'objectif est de vérifier l'état du disque, d'identifier les métadonnées re
 
 Avant toute intervention, vérifier les points suivants :
 
-- L'ancien OSD a été correctement retiré du cluster Ceph.
 - Le disque ne contient aucune donnée à conserver.
-- Le disque n'est plus utilisé par un OSD actif.
 - Le disque système et les autres disques de données ont été identifiés.
 - L'état du cluster Ceph a été contrôlé.
 
